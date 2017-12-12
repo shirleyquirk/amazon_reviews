@@ -1,0 +1,346 @@
+#Screenscrape Amazon products sold by Delicioso
+#Save a database of Product Reviews
+#Notify when new Product Reviews appear
+
+
+#Three places to check:
+#Delicioso Storefront
+
+
+#TODO:
+# Clean up
+# Deal with exceptions: internet drops, returns 404, etc.
+# Keep data in redis while downloading, restart scrape from middle
+# 
+
+
+
+import requests
+from bs4 import BeautifulSoup as BS
+import time
+import msgpack
+
+from os import listdir
+
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from datetime import datetime
+import configparser
+
+CONF_FILE='.conf'
+config=configparser.ConfigParser()
+config.read(CONF_FILE)
+
+#TODO:handle config exceptions
+def send_mail(sub,p,h):
+    email=config['email']
+    fr=email['from']
+    to=email['to']
+    cc=email['cc']
+    msg=MIMEMultipart('alternative')
+    msg['Subject']=sub
+    msg['From']=fr
+    msg['To']=to
+    msg['Cc']=cc
+    part1=MIMEText(p,'plain')
+    part2=MIMEText(h,'html')
+    msg.attach(part1)
+    msg.attach(part2)
+    s=smtplib.SMTP(email['serv'],email['port'])
+    s.ehlo()
+    #s.starttls()
+    #s.ehlo()
+    #s.login(fr,config['email']['pass'])
+    s.sendmail(fr,[to,cc],msg.as_string())
+    s.close()
+
+#curl 'https://www.amazon.co.uk/gp/aag/ajax/getAsinListJson.html' --data 'seller=A3GKWUMXBXC7X2&marketplaceID=A1F83G8C2ARO7P&useMYI=0&searchString=&currentPage=2' --compressed
+#TODO:handle marketplaces...defaults to .co.uk
+def parse_rev(rev):
+    '''returns dictionary from beautiful soup parsed amazon review page'''
+    r={}
+    r['rev_text']=rev.find(class_='review-text').text
+    r['rev_author']=rev.find(class_='author').text
+    r['rev_profile']="https://www.amazon.co.uk"+rev.find(class_='author')['href']
+    r['rev_stars']=int(rev.find(class_='a-icon-alt').text[:1])
+    r['rev_title']=rev.find(class_='review-title').text
+    r['rev_date']=rev.find(class_='review-date').text[3:]
+    r['rev_id']=rev['id']
+    return r
+def parse_item(s):
+    '''returns dictionary from beautiful soup parsed amazon item page'''
+    ###TODO: customer questions
+    d={}
+    d['prod_link']=s.find(class_='\\"aagImgLink\\"')['href'][2:-2]
+    #now strip out everything after the '/ref='
+    ref=d['prod_link'].find('/ref=')
+    d['prod_link']=d['prod_link'][:ref]
+    
+    d['asin']=d['prod_link'][d['prod_link'].rfind('/')+1:]
+    d['img_link']=s.find(class_='\\"aagImgLink\\"').img['src'][2:-2]
+    d['title']=s.find(class_='\\"AAG_ProductTitle').text
+    stars=s.find(class_='\\"crAvgStars\\"')
+    if stars==None:
+        d['rating']=None
+        d['num_reviews']=0
+    else:
+        d['rating']=float(stars.img['alt'][2:])
+        d['num_reviews']=int(stars.find_all('a')[-1].text)
+    d['review_link']='https://www.amazon.co.uk/product-reviews/'+d['asin']
+    d['reviews']={}
+    return d
+
+
+import random
+_batch_size=100
+_left_in_batch=1000
+_last_request_time=0
+_delay=6
+
+def time_since_last_request():
+    if _last_request_time:
+        return time.time()-_last_request_time
+    else:
+        return 0
+
+useragent={'User-Agent':config['scrape']['useragent']}
+
+def scrape_revs(asin,num_revs):
+    newrevs=[]
+    revs=[]
+    pnum=0
+    global _delay
+    global _last_request_time
+    global _left_in_batch
+    global _batch_size
+    global useragent
+    while len(revs)<num_revs:
+        pnum+=1
+        tslr=time_since_last_request()
+        #delay=_delay*random.randrange(80,160)/100
+        delay=random.randrange(1,5)
+        delay=0
+        print('delay:',delay)
+        if delay>tslr:
+            time.sleep(delay-tslr)
+            
+        if _left_in_batch==0:
+            #pause for a bit anyway
+            print("Taking a break for a minute or two")
+            _left_in_batch=random.randrange(int(_batch_size*0.8),int(_batch_size*1.2))
+            time.sleep(random.randrange(50,150))
+            _delay=random.randrange(5,50)
+            #print('new delay:',_delay)
+        else:
+            _left_in_batch-=1
+        
+        _last_request_time=time.time()
+        r=requests.get("https://www.amazon.co.uk/product-reviews/"+asin+"/ref=cm_cr_arp_d_paging_btm_next_2?sortBy=recent&pageNumber="+str(pnum)+"&pageSize=50",headers=useragent)
+
+        while r.status_code==503:
+            print("They're on to us!!! pausing for one minute")
+            #_delay=random.randrange(5,50)
+            #print('new delay:',_delay)
+            time.sleep(100+delay)
+            r=requests.get("https://www.amazon.co.uk/product-reviews/"+asin+"/ref=cm_cr_arp_d_paging_btm_next_2?sortBy=recent&pageNumber="+str(pnum)+"&pageSize=50",headers=useragent)
+        try:
+            assert r.status_code==200
+        except AssertionError:
+            print("Error Status: ",r.status_code,r.text)
+        print('reviews fine',asin,pnum)
+        soup=BS(r.text,'lxml')
+        newrevs=soup.find(id='cm_cr-review_list').find_all(class_='review')
+        #if len(newrevs)==0:
+            #break
+        assert newrevs
+        revs+=newrevs
+    #return revs
+    revdict={}
+    for r in revs:
+        pr=parse_rev(r)
+        pr['asin']=asin
+        revdict[pr['rev_id']]=pr
+    return revdict
+
+def scrape_one(seller_id,pg):
+    global _delay
+    global _last_request_time
+    
+    data={'seller':seller_id,'currentPage':pg}
+    tslr=time_since_last_request()
+    #delay=_delay*random.randrange(80,260)/100
+    delay=random.randrange(2,10)
+    if delay>tslr:
+        time.sleep(delay-tslr)
+    _last_request_time=time.time()
+    r=requests.post("https://www.amazon.co.uk/gp/aag/ajax/getAsinListJson.html",data=data,headers=useragent)
+
+    while r.status_code==503:
+        print("They're on to us!!! pausing for one minute")
+        _delay=random.randrange(5,50)
+        print('new delay:',_delay)
+        time.sleep(60+_delay)
+        r=requests.post("https://www.amazon.co.uk/gp/aag/ajax/getAsinListJson.html",data=data,headers=useragent)
+    assert r.status_code==200
+    print('items fine')
+    soup=BS(r.text,'lxml')
+    return soup.find_all('ul')
+
+def pretty_rev(items,r):
+    colors={1:'"red"',2:'"magenta"',3:'"orange"',4:'"black"',5:'"black"'}
+    plain=\
+    'Title: '+r['rev_title']+' <https://www.amazon.co.uk/gp/customer-reviews/'+r['rev_id']+'>\n'+\
+    "Stars:"+str(r['rev_stars'])+'\n'+\
+    "Date: "+r['rev_date']+'\n'+\
+    'Author: '+r['rev_author']+' <'+r['rev_profile']+'>\n'+\
+    'Item: '+items[r['asin']]['title']+' <https://www.amazon.co.uk/product-reviews/'+r['asin']+'>\n'
+    'Text: '+r['rev_text']+'\n\n'
+    html='''
+    <div>
+    Title: <a href="https://www.amazon.co.uk/gp/customer-reviews/'''+r['rev_id']+'">'+r['rev_title']+'''</a><br>
+    <font color='''+colors[r['rev_stars']]+'''>Stars: '''+str(r['rev_stars'])+'''</font><br>
+    Date: '''+r['rev_date']+'''<br>
+    Author: <a href="'''+r['rev_profile']+'">'+r['rev_author']+'''</a><br>
+    Item: <a href="https://www.amazon.co.uk/product-reviews/'''+r['asin']+'">'+items[r['asin']]['title']+'''</a><br>
+    Text: '''+r['rev_text']+'''<br><hr>
+    </div>
+    '''
+    return plain,html
+def pretty_asin(i):
+    plain='Item: '+i['title']+'<'+i['prod_link']+'>\n'\
+        +'Rating: '+str(i['rating'])+'\n'
+    html='''<div>
+        Item: <a href="'''+i['prod_link']+'">'+i['title']+'''</a><br>
+        Rating: '''+str(i['rating'])+'''<br><hr></div>'''
+    return plain,html
+    
+class StoreFront():
+    def __init__(self,s_id):
+        self.seller_id=s_id
+        #self.scrape_items()
+        #self.scrape_reviews()
+        #self.prev_Reviews=self.revlist()
+    def archive(self):
+        n='.items'+str(int(time.time()))
+        with open(n,'wb') as f:
+            f.write(msgpack.packb(self.items))
+        return n
+    def load_archive(self,name):
+        try:
+            with open(name,'rb') as f:
+                self.items=msgpack.unpackb(f.read(),encoding='utf-8')
+        except FileNotFoundError:
+            print("Archive Does Not Exist")
+    def list_archives(self):
+        return [f for f in listdir() if f[:6]=='.items']
+        
+    def save(self):
+        with open('.items','wb') as f:
+            f.write(msgpack.packb(self.items))
+            
+    def summary(self):
+        stars={1:[],2:[],3:[],4:[],5:[]}
+        allreviews={}
+        for i in self.items:
+            if self.items[i]['num_reviews']:
+                for r in self.items[i]['reviews']:
+                    allreviews[r]=self.items[i]['reviews'][r]
+                    stars[self.items[i]['reviews'][r]['rev_stars']].append(r)
+        for s in stars:
+            stars[s].sort(key=lambda x: datetime.strptime(allreviews[x]['rev_date'],'%d %B %Y'),reverse=True)
+        sw={1:'One',2:'Two',3:'Three',4:'Four',5:'Five'}
+        for w in sw:
+            p,h=sw[w]+' Star Reviews\n\n','<div><h2>'+sw[w]+' Star Reviews</h2></div>'
+            for r in stars[w]:
+                pp,hh=pretty_rev(self.items,allreviews[r])
+                p+=pp
+                h+=hh
+            send_mail(sw[w]+' Star Reviews',p,h)
+            time.sleep(5)
+    def update(self):
+        #attempt to load from disk
+        mostrecent=sorted(self.list_archives())[-1]
+        with open(mostrecent,'rb') as f:
+                Prev=msgpack.unpackb(f.read(),encoding='utf-8')
+        
+        self.scrape_items()
+        self.scrape_reviews()
+        self.archive()
+        #get change from last time. dropped items, added items.
+        for i in Prev:
+            if 'reviews' not in Prev[i]:
+                Prev[i]['reviews']={}
+        for i in self.items:
+            if 'reviews' not in self.items[i]:
+                self.items[i]['reviews']={}
+        addedasins=[a for a in self.items if a not in Prev]
+        droppedasins=[a for a in Prev if a not in self.items]
+        
+        newreviews=[]
+                
+        for asin in self.items:
+            if asin not in Prev:#new product listing
+                pass#newitems.append(asin)
+            else:
+                for r in self.items[asin]['reviews']:
+                    if r not in Prev[asin]['reviews']:
+                        newreviews.append(self.items[asin]['reviews'][r])
+        p,h='New Reviews\n\n','<div><h3>New Reviews</h3><br><hr></div>'
+        for r in newreviews:
+            pp,hh=pretty_rev(self.items,r)
+            p+=pp
+            h+=hh
+        #send_mail('New Reviews',p,h)
+        p +='\nNew Items\n\n'
+        h +='<div><br><h3>New Items</h3><br><hr></div>'
+        for a in addedasins:
+            pp,hh=pretty_asin(self.items[a])
+            p+=pp
+            h+=hh
+        p+='\nDropped Items\n\n'
+        h+='<div><br><h3>Dropped Items</h3><br><hr></div'
+        for a in droppedasins:
+            pp,hh=pretty_asin(Prev[a])
+            p+=pp
+            h+=hh
+        send_mail('Update',p,h)
+        
+        
+        
+        
+ 
+    def scrape_items(self):
+        i=0
+        items=[]
+        newitems=[None]
+        while len(newitems):
+            i+=1
+            newitems=scrape_one(self.seller_id,i)
+            items+=newitems
+        self.items={}
+        for i in items:
+            a=parse_item(i)
+            self.items[a['asin']]=a
+
+    def scrape_reviews(self):
+        for asin in self.items:
+            nr=self.items[asin]['num_reviews']
+            if nr>0:
+                self.items[asin]['reviews']=scrape_revs(asin,nr)
+                
+    def revlist(self):
+        revs=[]
+        for asin in self.items:
+            if self.items[asin]['num_reviews']>0:
+                revs+=self.items[asin]['reviews'].keys()
+        return tuple(revs)
+    
+
+Delicioso=StoreFront(config['scrape']['store_id'])
+
+#Delicioso.scrape_items()
+Delicioso.update()
+
+
+#Delicioso.summary()
